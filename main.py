@@ -1,29 +1,160 @@
-# YouTube Video Note-Taking POC
+# Install the necessary libraries
+!pip install youtube-transcript-api
+!pip install ipywidgets
+!pip install openai==0.28.0
 
-## Overview
-This Python-based application serves as a proof of concept for a note-taking feature specifically designed for YouTube videos. It allows users to extract and format specific passages from YouTube video transcripts based on user-provided timestamps and descriptions. This tool is ideal for users looking to quickly gather notes from their favorite sections of videos without manually tracking down the information.
+# Import the necessary libraries
+from youtube_transcript_api import YouTubeTranscriptApi
+import openai
+import re
+import ipywidgets as widgets
+from IPython.display import display, HTML
+from getpass import getpass
+from urllib.parse import urlparse, parse_qs
+import textwrap  # Import textwrap for text wrapping
+import json
 
-## Features
-- **Extract Video IDs and Timestamps:** Parses user-inputted YouTube URLs to extract video IDs and timestamps.
-- **Retrieve and Truncate Transcripts:** Utilizes the YouTube Transcript API to fetch full video transcripts and truncate them around the specified timestamps.
-- **Generate Formatted Passages:** Sends the relevant transcript sections to an AI model (GPT-4) to extract and neatly format passages.
-- **User-Friendly Output:** Provides the extracted passages in a clear and readable format, ready for note-taking or content review.
+# Set your OpenAI API key securely
+openai.api_key = getpass("Enter your OpenAI API key: ")
 
-## Usage Instructions
-1. **Prepare Input Data:**
-   - Input should be provided in the format: `idea description: timestamp URL`.
-   - To get a timestamp URL, right-click on the desired time point in a YouTube video and select "Copy URL at current time."
+# Function to extract video IDs, timestamps, and context from text
+def extract_video_info(text):
+    lines = text.strip().split('\n')
+    results = []
+    context = ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue  # Skip empty lines
+        url_match = re.search(r'(https?://[^\s]+)', line)
+        if url_match:
+            url = url_match.group(1)
+            parsed_url = urlparse(url)
+            query_params = parse_qs(parsed_url.query)
+            video_id = None
+            timestamp = None
+            if 'youtu.be' in parsed_url.netloc:
+                video_id = parsed_url.path.lstrip('/')
+                timestamp = query_params.get('t', [None])[0]
+            elif 'youtube.com' in parsed_url.netloc:
+                video_id = query_params.get('v', [None])[0]
+                timestamp = query_params.get('t', [None])[0]
+            if video_id:
+                timestamp = int(timestamp) if timestamp else None
+                context_text = context.strip()
+                results.append((video_id, timestamp, context_text))
+                context = ""
+        else:
+            context += line + " "
+    return results
 
-2. **Running the Application:**
-   - This project is designed to run in Google Colab, providing a user-friendly interface and seamless environment setup.
-   - Open the notebook in Google Colab, follow the on-screen prompts to paste the formatted input into the provided text area, and press the "Continue" button to process the input and retrieve the formatted notes.
+# Function to fetch and truncate the transcript around the timestamp
+def fetch_truncated_transcript(video_id, timestamp, window=240):
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+        if timestamp is None:
+            timestamp = transcript[0]['start']
+        start_time = max(0, timestamp - window)
+        end_time = timestamp + window
+        truncated_entries = [
+            entry for entry in transcript if (entry['start'] + entry['duration'] >= start_time) and (entry['start'] <= end_time)
+        ]
+        truncated_transcript = ''
+        for entry in truncated_entries:
+            time_stamp = round(entry['start'], 2)
+            text = entry['text']
+            truncated_transcript += f"Time: {time_stamp} - Text: {text}\n"
+        return truncated_transcript, timestamp
+    except Exception as e:
+        return f"Failed to fetch the transcript: {str(e)}", None
 
-## Current Limitations
-- This is an early version and the user experience is not fully optimized.
-- Currently, the application requires manual input of URLs and descriptions, which may not be ideal for all users.
+# Function to use GPT model for generating insights from transcript in JSON format
+def chatgpt_call(truncated_transcript, timestamp, context_timestamp):
+    prompt = f"""
+    Consult this transcript:
+    "{truncated_transcript}"
 
-## Future Enhancements
-- **Browser Extension:** Plans are underway to transform this POC into a browser extension. This will allow users to select and note sections directly within the YouTube interface, eliminating the need to manually track and input text.
+    Task:
+    - Locate and extract the passage at timestamp {timestamp}. Ensure to include surrounding context if relevant for clarity.
 
-## Note
-This project is intended as a proof of concept. The functionality and user interface are basic and intended for demonstration purposes. User feedback is welcome to improve the tool as development progresses.
+    Requirements:
+    - Do not edit or modify the actual content of the passage.
+    - Remove any "time: [X] - Text:" formatting and present the text as a coherent paragraph.
+    - Make minor proofreading and transcription corrections for readability.
+
+    Context:
+    - The core idea of interest is around the timestamp {timestamp}, specifically relating to the idea of "{context_timestamp}".
+
+    Goal:
+    - Your goal is to extract the idea that was talked about at timestamp {timestamp}.
+    - It should form a coherent argument or observation, so attempt to go as far back and as far forward as you need to in order to not cut the idea off, and the note extracted is intelligible on its own right.
+
+    Output Specification:
+    Format the response as a JSON object with these key-value pairs:
+    - "Commentary": A string containing your model's comments on the output.
+    - "Title": A short, descriptive and specific title for this piece of text about the idea captured.
+    - "Text": A string of the exact transcript text with the additional context as needed and with minor proofreading for readability. No additional comments should be included.
+    """
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Extract and format a passage from a transcript based on a specific timestamp. Output must be in JSON format, adhering to the prompt instructions."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500
+        )
+        output = response.choices[0].message['content'].strip()
+        cleaned_output = output.replace('```json', '').replace('```', '').strip()
+        json_output = json.loads(cleaned_output)
+        return json_output  # Fetching the entire JSON output including title, commentary, and text
+    except json.JSONDecodeError as e:
+        return f"JSON decoding error: {e}\nResponse received: '{output}'"
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+# Function to display all insights in one textarea with a copy button
+def display_html_insight(all_insights):
+    all_insights_text = "\n\n".join([f"**{insight['Title']}**\n{insight['Text']}" for insight in all_insights])  # Create formatted insights text
+    html = f"""
+    <textarea id='text_area_all' style="width:90%; height:200px;">{all_insights_text}</textarea><br>
+    <button onclick="copyToClipboard()">Copy</button>
+    <script>
+    function copyToClipboard() {{
+      var copyText = document.getElementById('text_area_all');
+      copyText.select();  // Select the text field
+      document.execCommand('copy');  // Copy the text inside the text field
+    }}
+    </script>
+    """
+    display(HTML(html))
+
+# Function to process input after button click
+def process_input(button):
+    text_input = textarea.value.strip()
+    video_info_list = extract_video_info(text_input)
+    all_insights = []  # List to store all insights
+    for idx, (video_id, timestamp, context_timestamp) in enumerate(video_info_list):
+        truncated_transcript, used_timestamp = fetch_truncated_transcript(video_id, timestamp)
+        if truncated_transcript:
+            json_output = chatgpt_call(truncated_transcript, used_timestamp, context_timestamp)
+            all_insights.append(json_output)  # Append each JSON output to the list
+        else:
+            print("No transcript text available to generate insights.")
+    if all_insights:
+        display_html_insight(all_insights)  # Display all insights in one textarea
+
+# Create UI components
+textarea = widgets.Textarea(
+    value='',
+    placeholder='Paste your text and YouTube links here. Each link should contain the video ID and timestamp.',
+    description='Input:',
+    disabled=False,
+    layout={'width': '100%', 'height': '200px'}
+)
+
+button = widgets.Button(description="Continue")
+button.on_click(process_input)
+
+# Display UI components
+display(textarea, button)
